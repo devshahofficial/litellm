@@ -40,8 +40,10 @@ from litellm.llms.custom_httpx.http_handler import (
 )
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.utils import GenericGuardrailAPIInputs
 
 if TYPE_CHECKING:
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
     from litellm.types.proxy.guardrails.guardrail_hooks.base import (
         GuardrailConfigModel,
     )
@@ -193,6 +195,36 @@ class ResembleGuardrail(CustomGuardrail):
         await self._scan_request(data)
         return data
 
+    @log_guardrail_information
+    async def apply_guardrail(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+        input_type: Literal["request", "response"],
+        logging_obj: Optional["LiteLLMLoggingObj"] = None,
+    ) -> GenericGuardrailAPIInputs:
+        """
+        Apply Resemble Detect through LiteLLM's generic guardrail endpoint.
+
+        The generic path supplies normalized texts/images/structured messages
+        instead of the raw chat request shape, so collect URLs from both the
+        normalized inputs and the original request data before scanning.
+        """
+        media_urls = self._extract_media_urls_from_guardrail_inputs(
+            inputs=inputs,
+            request_data=request_data,
+        )
+        if not media_urls:
+            verbose_proxy_logger.debug(
+                "Resemble guardrail: no media URL found in %s inputs — passing through",
+                input_type,
+            )
+            return inputs
+
+        for media_url in media_urls:
+            await self._scan_single_url(media_url)
+        return inputs
+
     # ------------------------------------------------------------------
     # Core scan logic
     # ------------------------------------------------------------------
@@ -296,6 +328,37 @@ class ResembleGuardrail(CustomGuardrail):
         for url in self._urls_from_text(messages, data):
             _add(url)
         for url in self._urls_from_metadata(data):
+            _add(url)
+
+        return list(seen.keys())
+
+    def _extract_media_urls_from_guardrail_inputs(
+        self,
+        inputs: GenericGuardrailAPIInputs,
+        request_data: dict,
+    ) -> List[str]:
+        """Collect media URLs from generic guardrail inputs and request data."""
+        seen: Dict[str, None] = {}
+
+        def _add(url: Optional[str]) -> None:
+            if isinstance(url, str) and url and url not in seen:
+                seen[url] = None
+
+        for url in inputs.get("images", []) or []:
+            _add(url)
+
+        for text in inputs.get("texts", []) or []:
+            if isinstance(text, str):
+                for match in MEDIA_URL_REGEX.finditer(text):
+                    _add(match.group(0))
+
+        structured_messages = inputs.get("structured_messages", []) or []
+        for url in self._urls_from_content_parts(structured_messages):
+            _add(url)
+        for url in self._urls_from_text(structured_messages, {}):
+            _add(url)
+
+        for url in self._extract_media_urls(request_data):
             _add(url)
 
         return list(seen.keys())
@@ -484,24 +547,28 @@ class ResembleGuardrail(CustomGuardrail):
         if isinstance(metrics, dict):
             return (
                 str(metrics.get("label") or "unknown").lower(),
-                float(metrics.get("aggregated_score") or 0),
+                self._coerce_score(metrics.get("aggregated_score")),
             )
 
         image_metrics = item.get("image_metrics")
         if isinstance(image_metrics, dict):
             return (
                 str(image_metrics.get("label") or "unknown").lower(),
-                float(image_metrics.get("score") or 0),
+                self._coerce_score(image_metrics.get("score")),
             )
 
         video_metrics = item.get("video_metrics")
         if isinstance(video_metrics, dict):
             return (
                 str(video_metrics.get("label") or "unknown").lower(),
-                float(video_metrics.get("score") or 0),
+                self._coerce_score(video_metrics.get("score")),
             )
 
         return ("unknown", 0.0)
+
+    @staticmethod
+    def _coerce_score(score: Any) -> float:
+        return float(score if score is not None else 0)
 
     @staticmethod
     def get_config_model() -> Optional[Type["GuardrailConfigModel"]]:

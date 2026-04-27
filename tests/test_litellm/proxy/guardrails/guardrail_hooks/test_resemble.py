@@ -1,6 +1,6 @@
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -335,6 +335,11 @@ class TestEvaluateDetection:
         result = self.guard._evaluate_detection(item)
         assert result["verdict"] is True
 
+    def test_zero_score_is_preserved(self):
+        item = {"metrics": {"label": "real", "aggregated_score": 0.0}}
+        result = self.guard._evaluate_detection(item)
+        assert result["score"] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # Hook behaviour tests (mocked HTTP)
@@ -357,6 +362,69 @@ async def test_pre_call_passes_without_media_url():
         )
     assert result == data
     post_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_scans_generic_image_inputs():
+    guard = _make_guardrail()
+    inputs = {"images": ["https://cdn.example.com/image.jpg"]}
+
+    create_response = _fake_post_response(
+        {
+            "success": True,
+            "item": {
+                "uuid": "img-2",
+                "status": "completed",
+                "media_type": "image",
+                "image_metrics": {"label": "real", "score": 0.1},
+            },
+        }
+    )
+
+    with patch(
+        "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+        return_value=create_response,
+    ) as post_mock:
+        result = await guard.apply_guardrail(
+            inputs=inputs,
+            request_data={},
+            input_type="request",
+        )
+
+    assert result == inputs
+    assert (
+        post_mock.call_args.kwargs["json"]["url"]
+        == "https://cdn.example.com/image.jpg"
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_blocks_generic_text_media_url():
+    guard = _make_guardrail()
+    inputs = {"texts": ["check https://cdn.example.com/cloned.wav"]}
+
+    create_response = _fake_post_response(
+        {
+            "success": True,
+            "item": {
+                "uuid": "audio-2",
+                "status": "completed",
+                "media_type": "audio",
+                "metrics": {"label": "fake", "aggregated_score": "0.9"},
+            },
+        }
+    )
+
+    with patch(
+        "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+        return_value=create_response,
+    ):
+        with pytest.raises(HTTPException):
+            await guard.apply_guardrail(
+                inputs=inputs,
+                request_data={},
+                input_type="request",
+            )
 
 
 @pytest.mark.asyncio
@@ -608,7 +676,7 @@ async def test_create_payload_includes_flags():
         }
     )
 
-    post_mock = MagicMock(return_value=create_response)
+    post_mock = AsyncMock(return_value=create_response)
     with patch(
         "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
         new=post_mock,
